@@ -135,33 +135,142 @@ NUMBER_MAP = {
 # ══════════════════════════════════════════════════════════════════
 # ४. Text Processor
 # ══════════════════════════════════════════════════════════════════
+# ── बड़ा Number converter (100, 50%, 3.5 lakh etc.) ──
+def number_to_hindi_words(num_str):
+    """Complex numbers ko Hindi words mein badlo"""
+    num_str = num_str.strip()
+    # Percentage
+    if num_str.endswith('%'):
+        n = number_to_hindi_words(num_str[:-1])
+        return n + " प्रतिशत"
+    # Decimal
+    if '.' in num_str:
+        parts = num_str.split('.', 1)
+        return number_to_hindi_words(parts[0]) + " दशमलव " + number_to_hindi_words(parts[1])
+    try:
+        n = int(num_str)
+    except:
+        return num_str
+    if n == 0: return "शून्य"
+    ones = ["","एक","दो","तीन","चार","पाँच","छह","सात","आठ","नौ",
+            "दस","ग्यारह","बारह","तेरह","चौदह","पंद्रह","सोलह","सत्रह",
+            "अठारह","उन्नीस","बीस","इक्कीस","बाईस","तेईस","चौबीस","पच्चीस",
+            "छब्बीस","सत्ताईस","अट्ठाईस","उनतीस","तीस","इकतीस","बत्तीस",
+            "तैंतीस","चौंतीस","पैंतीस","छत्तीस","सैंतीस","अड़तीस","उनतालीस",
+            "चालीस","इकतालीस","बयालीस","तैंतालीस","चौंतालीस","पैंतालीस",
+            "छियालीस","सैंतालीस","अड़तालीस","उनचास","पचास","इक्यावन","बावन",
+            "तिरपन","चौवन","पचपन","छप्पन","सत्तावन","अट्ठावन","उनसठ","साठ",
+            "इकसठ","बासठ","तिरसठ","चौंसठ","पैंसठ","छियासठ","सड़सठ","अड़सठ",
+            "उनहत्तर","सत्तर","इकहत्तर","बहत्तर","तिहत्तर","चौहत्तर","पचहत्तर",
+            "छिहत्तर","सतहत्तर","अठहत्तर","उनासी","अस्सी","इक्यासी","बयासी",
+            "तिरासी","चौरासी","पचासी","छियासी","सत्तासी","अट्ठासी","नवासी","नब्बे",
+            "इक्यानवे","बानवे","तिरानवे","चौरानवे","पचानवे","छियानवे","सत्तानवे",
+            "अट्ठानवे","निन्यानवे"]
+    if n < 100:
+        return ones[n]
+    elif n < 1000:
+        h = n // 100
+        r = n % 100
+        s = ones[h] + " सौ"
+        if r: s += " " + ones[r]
+        return s
+    elif n < 100000:
+        h = n // 1000
+        r = n % 1000
+        s = ones[h] + " हज़ार"
+        if r: s += " " + number_to_hindi_words(str(r))
+        return s
+    elif n < 10000000:
+        h = n // 100000
+        r = n % 100000
+        s = ones[h] + " लाख"
+        if r: s += " " + number_to_hindi_words(str(r))
+        return s
+    else:
+        h = n // 10000000
+        r = n % 10000000
+        s = ones[h] + " करोड़"
+        if r: s += " " + number_to_hindi_words(str(r))
+        return s
+
+def convert_all_numbers(text):
+    """Sabhi numbers — integers, decimals, percentages — Hindi mein"""
+    # Percentage pehle
+    text = re.sub(r'(\d+(?:\.\d+)?)%',
+                  lambda m: number_to_hindi_words(m.group(0)), text)
+    # Decimal numbers
+    text = re.sub(r'(\d+\.\d+)',
+                  lambda m: number_to_hindi_words(m.group(0)), text)
+    # Pure integers (2+ digits = full convert, 1 digit = ones map)
+    text = re.sub(r'\b(\d+)\b',
+                  lambda m: number_to_hindi_words(m.group(0)), text)
+    return text
+
 def apply_all_dicts(text, custom_dict):
+    # 1. Custom dict (highest priority)
     for src, tgt in custom_dict.items():
-        text = re.sub(rf'(?<![a-zA-Z\u0900-\u097F]){re.escape(src)}(?![a-zA-Z\u0900-\u097F])',
-                      tgt, text, flags=re.IGNORECASE)
+        text = re.sub(
+            rf'(?<![a-zA-Z\u0900-\u097F]){re.escape(src)}(?![a-zA-Z\u0900-\u097F])',
+            tgt, text, flags=re.IGNORECASE)
+    # 2. Sanskrit
     for src, tgt in SANSKRIT_DICT.items():
         text = re.sub(rf'(?<![a-zA-Z]){re.escape(src)}(?![a-zA-Z])',
                       tgt, text, flags=re.IGNORECASE)
+    # 3. English → Hindi phonetic
     for src, tgt in ENGLISH_TO_HINDI.items():
         text = re.sub(rf'(?<![a-zA-Z]){re.escape(src)}(?![a-zA-Z])',
                       tgt, text, flags=re.IGNORECASE)
-    for num in sorted(NUMBER_MAP.keys(), key=lambda x: -len(x)):
-        text = re.sub(rf'\b{num}\b', NUMBER_MAP[num], text)
+    # 4. Numbers → full Hindi words
+    text = convert_all_numbers(text)
     return text
 
 def clean_punctuation(text):
-    text = re.sub(r'[।\.](\s|$)', '। ', text)
+    """
+    HAKLAHAT + LAHRAANA FIX:
+    - ?, !, ., । ke baad PAUSE dalo (XTTS pause samjhega)
+    - ... ellipsis = lamba pause
+    - Unwanted chars hatao
+    """
+    # Ellipsis → lamba pause
+    text = re.sub(r'\.\.\.[\s]*', '। ', text)
+    # Question mark — XTTS confuse hota hai, replace karo pause se
+    # (Yahi haklahat ka ek bada karan tha)
+    text = re.sub(r'\?[\s]*', '। ', text)
+    # Exclamation → pause
+    text = re.sub(r'![\s]*', '! ', text)
+    # Full stop / devanagari purnaviram → pause with space
+    text = re.sub(r'([।\.])([^\s])', r'\1 \2', text)
+    text = re.sub(r'[।\.]\s*', '। ', text)
+    # Comma → natural pause
     text = re.sub(r'[,،]\s*', ', ', text)
-    text = re.sub(r'[!]\s*', '! ', text)
-    text = re.sub(r'[?]\s*', '? ', text)
+    # Dash → comma pause
     text = re.sub(r'[-–—]+', ', ', text)
-    text = re.sub(r'["""\'\'()\[\]{}]', '', text)
+    # Colon / semicolon → comma
+    text = re.sub(r'[;:]', ', ', text)
+    # Remove special chars
+    text = re.sub(r'["""\'\'()\[\]{}*#@&^~`|<>]', '', text)
+    # Multiple spaces → single
     text = re.sub(r'\s+', ' ', text)
+    # Multiple pauses → single
+    text = re.sub(r'(।\s*){2,}', '। ', text)
     return text.strip()
+
+def devanagari_normalize(text):
+    """
+    Devanagari special cases fix:
+    - Anusvar, chandrabindu, visarg sahi rakho
+    - Half characters aur conjuncts ke liye space mat dalo
+    """
+    # Zero-width joiner preserve karo (conjuncts ke liye)
+    # Extra spaces Devanagari words ke beech mat aane do
+    text = re.sub(r'([\u0900-\u097F])\s+([\u0900-\u097F])',
+                  lambda m: m.group(1) + ' ' + m.group(2), text)
+    return text
 
 def full_text_processor(text, custom_dict):
     if not text: return ""
     text = apply_all_dicts(text, custom_dict)
+    text = devanagari_normalize(text)
     text = clean_punctuation(text)
     return text
 
@@ -179,42 +288,85 @@ def preview_cleaned_text(text, custom_words_raw):
     return f"**Cleaned Text Preview:**\n\n{cleaned}\n\n---\n*{diff_count} words converted*"
 
 # ══════════════════════════════════════════════════════════════════
-# ५. Language-Aware Chunker
+# ५. Language-Aware Chunker v2 — Better English Detection
 # ══════════════════════════════════════════════════════════════════
-def language_aware_chunker(text, max_words=45):
-    sentences = re.split(r'(?<=[।\.\!\?])\s+', text.strip())
+def detect_chunk_language(words):
+    """
+    Chunk ki language accurately detect karo.
+    Mixed text (Hindi+English) = hi (kyunki XTTS hi mode mein
+    Devanagari + phonetic English dono bol sakta hai)
+    Pure English only chunk = en
+    """
+    if not words: return "hi"
+    total = len(words)
+    devanagari_words = 0
+    pure_latin_words = 0
+    for w in words:
+        deva = sum(1 for c in w if '\u0900' <= c <= '\u097F')
+        lat  = sum(1 for c in w if c.isascii() and c.isalpha())
+        if deva > 0:
+            devanagari_words += 1
+        elif lat == len(w) and lat > 0:
+            pure_latin_words += 1
+    # Sirf tab "en" lo jab koi Devanagari nahi aur zyada English hai
+    if devanagari_words == 0 and pure_latin_words > total * 0.7:
+        return "en"
+    return "hi"  # Default always hi — mixed text ke liye bhi
+
+def language_aware_chunker(text, max_words=35):
+    """
+    STUTTER FIX:
+    - max_words 35 (pehle 45 tha — zyada words = zyada stutter)
+    - Sentence boundary pe hi toro
+    - Pure English chunk tabhi jab koi Hindi nahi
+    """
+    # Pause markers pe split karo
+    sentences = re.split(r'(?<=[।])\s+', text.strip())
+    # Agar sentence abhi bhi bada hai to comma pe bhi split karo
+    final_sentences = []
+    for s in sentences:
+        if len(s.split()) > max_words:
+            sub = re.split(r',\s*', s)
+            final_sentences.extend([x.strip() for x in sub if x.strip()])
+        else:
+            if s.strip():
+                final_sentences.append(s.strip())
+
     chunks_with_lang = []
     current_words, current_count = [], 0
 
     def commit(words):
         if not words: return
         chunk = ' '.join(words)
-        latin = sum(1 for w in words
-                    if sum(1 for c in w if c.isascii() and c.isalpha()) > len(w)//2)
-        lang = "en" if latin > len(words)*0.5 else "hi"
+        lang = detect_chunk_language(words)
         chunks_with_lang.append((chunk, lang))
 
-    for sentence in sentences:
+    for sentence in final_sentences:
         words = sentence.split()
         wc = len(words)
-        if wc > max_words:
-            if current_words: commit(current_words); current_words, current_count = [], 0
-            parts = re.split(r',\s*', sentence)
-            tmp, tc = [], 0
-            for part in parts:
-                pw = part.split()
-                if tc+len(pw) > max_words and tmp:
-                    commit(tmp); tmp, tc = pw, len(pw)
-                else:
-                    tmp.extend(pw); tc += len(pw)
-            if tmp: commit(tmp)
-        elif current_count+wc > max_words:
-            commit(current_words); current_words, current_count = words, wc
+        if wc == 0: continue
+        if current_count + wc > max_words:
+            commit(current_words)
+            current_words, current_count = words, wc
         else:
-            current_words.extend(words); current_count += wc
+            current_words.extend(words)
+            current_count += wc
 
     commit(current_words)
-    return [(c.strip(), l) for c, l in chunks_with_lang if c.strip()]
+    result = [(c.strip(), l) for c, l in chunks_with_lang if c.strip()]
+    # Minimum length check — 3 words se kam ke chunks merge karo
+    merged = []
+    i = 0
+    while i < len(result):
+        chunk, lang = result[i]
+        if len(chunk.split()) < 3 and i+1 < len(result):
+            next_chunk, next_lang = result[i+1]
+            merged.append((chunk + ' ' + next_chunk, lang))
+            i += 2
+        else:
+            merged.append((chunk, lang))
+            i += 1
+    return merged
 
 # ══════════════════════════════════════════════════════════════════
 # ६. Reference Audio — Prepare + Quality Check
@@ -416,12 +568,41 @@ def apply_eq(audio_seg, bass_db=5.0, mid_db=0.0, treble_db=-2.0, sr=22050):
 # ══════════════════════════════════════════════════════════════════
 # ११. Crossfade Join
 # ══════════════════════════════════════════════════════════════════
-def crossfade_join(segs, cf_ms=60):
+def volume_match(seg, target_rms=3000):
+    """Har chunk ka volume same karo — lahraana fix"""
+    samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    rms = np.sqrt(np.mean(samples**2))
+    if rms < 100: return seg  # silence skip
+    gain = target_rms / (rms + 1e-9)
+    gain = np.clip(gain, 0.3, 3.0)  # extreme gain avoid karo
+    return seg.apply_gain(20 * np.log10(gain))
+
+def crossfade_join(segs, cf_ms=80):
+    """
+    LAHRAANA + JUMP FIX:
+    - Pehle har segment ka volume match karo
+    - Phir crossfade join karo (80ms — smooth)
+    - Short silence (100ms) between chunks for breathing
+    """
     if not segs: return AudioSegment.silent(100)
-    result = segs[0]
-    for s in segs[1:]:
+    # Step 1: Volume normalize karo sabhi segments
+    # Average RMS nikalo
+    all_rms = []
+    for s in segs:
+        arr = np.array(s.get_array_of_samples(), dtype=np.float32)
+        rms = np.sqrt(np.mean(arr**2))
+        if rms > 100: all_rms.append(rms)
+    target = float(np.median(all_rms)) if all_rms else 3000
+
+    normalized = []
+    for s in segs:
+        normalized.append(volume_match(s, target_rms=target))
+
+    # Step 2: Crossfade join
+    result = normalized[0]
+    for s in normalized[1:]:
         cf = min(cf_ms, len(result)//2, len(s)//2)
-        result = result.append(s, crossfade=max(cf,10))
+        result = result.append(s, crossfade=max(cf, 20))
     return result
 
 # ══════════════════════════════════════════════════════════════════
