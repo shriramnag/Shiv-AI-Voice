@@ -5,3 +5,6 @@ pydub
 soundfile
 librosa
 TTS
+librosa 
+ffmpeg install
+  
