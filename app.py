@@ -428,10 +428,11 @@ def crossfade_join(segs, cf_ms=60):
 # १२. Emotion Presets
 # ══════════════════════════════════════════════════════════════════
 EMOTION_PRESETS = {
-    "🧘 शांत (Calm)":       {"temperature":0.20,"rep_pen":7.0,"speed":0.92},
-    "😊 सामान्य (Normal)":  {"temperature":0.35,"rep_pen":6.0,"speed":1.00},
-    "🎙️ प्रो (Pro)":        {"temperature":0.50,"rep_pen":5.0,"speed":1.05},
-    "🔥 नाटकीय (Dramatic)": {"temperature":0.68,"rep_pen":4.0,"speed":1.10},
+    # temperature values — generation mein safe_temp = min(val, 0.30) se cap hota hai
+    "🧘 शांत (Calm)":       {"temperature":0.15,"rep_pen":8.0,"speed":0.90},
+    "😊 सामान्य (Normal)":  {"temperature":0.25,"rep_pen":7.0,"speed":0.97},
+    "🎙️ प्रो (Pro)":        {"temperature":0.28,"rep_pen":6.5,"speed":1.02},
+    "🔥 नाटकीय (Dramatic)": {"temperature":0.30,"rep_pen":6.0,"speed":1.08},
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -501,9 +502,9 @@ def generate_v35(
 
     ref_quality = check_ref_quality(ref)
 
-    # Chunking
+    # Chunking — 40 words max (chhote = less stutter)
     progress(0.08, desc="✂️ Smart chunking...")
-    chunks = language_aware_chunker(p_text, max_words=45)
+    chunks = language_aware_chunker(p_text, max_words=40)
     total  = len(chunks)
     if total == 0:
         return None, "❌ Text empty after processing.", ref_quality, gr.update(choices=[])
@@ -514,12 +515,14 @@ def generate_v35(
         progress((i+1)/total*0.80, desc=f"🎙️ Part {i+1}/{total} [{lang.upper()}]")
         name = f"chunk_{i}.wav"
         try:
-            # gpt_cond_len: voice match quality
-            # Higher = better speaker similarity, slower
+            # STUTTER FIX: temperature cap 0.30, length_penalty, top_p restrict
             try:
-                tts.synthesizer.tts_config.model_args.temperature        = float(temperature)
+                safe_temp = min(float(temperature), 0.30)
+                tts.synthesizer.tts_config.model_args.temperature        = safe_temp
                 tts.synthesizer.tts_config.model_args.repetition_penalty = float(rep_pen)
                 tts.synthesizer.tts_config.model_args.gpt_cond_len       = int(gpt_cond_len)
+                tts.synthesizer.tts_config.model_args.length_penalty     = 1.0
+                tts.synthesizer.tts_config.model_args.top_p              = 0.80
             except: pass
 
             tts.tts_to_file(
@@ -532,12 +535,15 @@ def generate_v35(
 
             seg = AudioSegment.from_wav(name)
 
+            # STUTTER FIX: padding 250ms, threshold less aggressive
             if use_silence:
                 try:
-                    seg = effects.strip_silence(seg, silence_thresh=-50, padding=180)
+                    seg = effects.strip_silence(
+                        seg, silence_thresh=-45, padding=250)
                 except: pass
 
-            if len(seg) > 80:
+            # STUTTER FIX: min 300ms — 80ms segments were causing clicks
+            if len(seg) > 300:
                 segments.append(seg)
                 cout = f"prev_{i+1}.wav"
                 seg.export(cout, format="wav")
@@ -737,22 +743,22 @@ with gr.Blocks(css=CSS, title="शिव AI v3.5") as demo:
                 # RIGHT — Controls
                 with gr.Column(scale=2):
 
-                    with gr.Group():
-                        gr.Markdown("### 🎤 Reference Voice")
-                        gr.Markdown("*1 clip: normal | 2-3 clips: better voice match*")
-                        up1 = gr.Audio(label="Clip 1 (main — 6-20 sec)", type="filepath")
-                        with gr.Row():
-                            up2 = gr.Audio(label="Clip 2 (optional)", type="filepath")
-                            up3 = gr.Audio(label="Clip 3 (optional)", type="filepath")
+                    with gr.Accordion("🎤 Reference Voice", open=True):
+                        gr.Markdown("*Main clip zaroori | Clip 2 & 3 se better match hoga*")
+                        up1 = gr.Audio(label="🎙️ Main Clip (6-20 sec — zaroori)", type="filepath")
                         ref_qual = gr.Textbox(
                             label="🔍 Quality Check",
-                            interactive=False, lines=4,
+                            interactive=False, lines=3,
                             elem_classes=["status-out"]
                         )
                         up1.change(check_ref_quality, [up1], [ref_qual])
+                        with gr.Accordion("➕ Extra Clips (optional — better match ke liye)", open=False):
+                            with gr.Row():
+                                up2 = gr.Audio(label="Clip 2", type="filepath")
+                                up3 = gr.Audio(label="Clip 3", type="filepath")
                         git_v = gr.Dropdown(
                             choices=["aideva.wav"],
-                            label="Default Voice (agar upload na karo)",
+                            label="🎵 Default Voice (upload na karo tab)",
                             value="aideva.wav"
                         )
 
