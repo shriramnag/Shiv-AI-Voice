@@ -685,55 +685,106 @@ def generate_v35(
 
     # Chunking — 40 words max (chhote = less stutter)
     progress(0.08, desc="✂️ Smart chunking...")
-    chunks = language_aware_chunker(p_text, max_words=40)
+    chunks = language_aware_chunker(p_text, max_words=35)
+    # Long audio estimate
+    est_minutes = len(chunks) * 0.4  # ~24sec per chunk on GPU
+    progress(0.09, desc=f"📊 Total {total} parts — ~{est_minutes:.0f} min GPU time")
     total  = len(chunks)
     if total == 0:
         return None, "❌ Text empty after processing.", ref_quality, gr.update(choices=[])
 
     segments, errors = [], []
 
-    for i, (chunk, lang) in enumerate(chunks):
-        progress((i+1)/total*0.80, desc=f"🎙️ Part {i+1}/{total} [{lang.upper()}]")
-        name = f"chunk_{i}.wav"
+    def safe_set_tts_params(temperature, rep_pen, gpt_cond_len):
+        """XTTS v2 params safely set karo — crash nahi hoga"""
+        safe_temp = min(float(temperature), 0.30)
+        # Method 1: synthesizer path (XTTS v2.0.x)
         try:
-            # STUTTER FIX: temperature cap 0.30, length_penalty, top_p restrict
+            cfg = tts.synthesizer.tts_config.model_args
+            cfg.temperature        = safe_temp
+            cfg.repetition_penalty = float(rep_pen)
+            cfg.gpt_cond_len       = int(gpt_cond_len)
+            cfg.length_penalty     = 1.0
+            cfg.top_p              = 0.80
+            return
+        except: pass
+        # Method 2: direct model config (XTTS v2.1.x)
+        try:
+            cfg = tts.tts_config
+            cfg.temperature = safe_temp
+            return
+        except: pass
+        # Method 3: synthesizer directly
+        try:
+            tts.synthesizer.temperature = safe_temp
+        except: pass
+
+    def generate_one_chunk(chunk_text, lang, out_path, speed):
+        """Ek chunk generate karo — retry ke saath"""
+        for attempt in range(2):  # 2 attempts
             try:
-                safe_temp = min(float(temperature), 0.30)
-                tts.synthesizer.tts_config.model_args.temperature        = safe_temp
-                tts.synthesizer.tts_config.model_args.repetition_penalty = float(rep_pen)
-                tts.synthesizer.tts_config.model_args.gpt_cond_len       = int(gpt_cond_len)
-                tts.synthesizer.tts_config.model_args.length_penalty     = 1.0
-                tts.synthesizer.tts_config.model_args.top_p              = 0.80
-            except: pass
+                safe_set_tts_params(temperature, rep_pen, gpt_cond_len)
+                actual_speed = float(speed) if float(speed) > 0 else 0.97
+                tts.tts_to_file(
+                    text=chunk_text,
+                    speaker_wav=ref,
+                    language=lang,
+                    file_path=out_path,
+                    speed=actual_speed,
+                )
+                return True, None
+            except Exception as e:
+                err = str(e)
+                if attempt == 0:
+                    # First fail: retry with simpler settings
+                    torch.cuda.empty_cache(); gc.collect()
+                    try:
+                        # Fallback: no extra params, just basic call
+                        tts.tts_to_file(
+                            text=chunk_text,
+                            speaker_wav=ref,
+                            language="hi",  # force Hindi on retry
+                            file_path=out_path,
+                            speed=0.97,
+                        )
+                        return True, None
+                    except Exception as e2:
+                        err = str(e2)
+                else:
+                    return False, err
+        return False, "Max retries reached"
 
-            tts.tts_to_file(
-                text=chunk,
-                speaker_wav=ref,
-                language=lang,
-                file_path=name,
-                speed=float(speed_s),
-            )
+    for i, (chunk, lang) in enumerate(chunks):
+        progress((i+1)/total*0.82, desc=f"🎙️ Part {i+1}/{total} [{lang.upper()}] — {len(chunk.split())} words")
+        # Unique filename per chunk — overwrite nahi hoga
+        name = f"shiv_chunk_{i}_{id(chunk) % 9999}.wav"
 
-            seg = AudioSegment.from_wav(name)
+        success, err_msg = generate_one_chunk(chunk, lang, name, speed_s)
 
-            # STUTTER FIX: padding 250ms, threshold less aggressive
-            if use_silence:
-                try:
-                    seg = effects.strip_silence(
-                        seg, silence_thresh=-45, padding=250)
-                except: pass
+        if success and os.path.exists(name):
+            try:
+                seg = AudioSegment.from_wav(name)
 
-            # STUTTER FIX: min 300ms — 80ms segments were causing clicks
-            if len(seg) > 300:
-                segments.append(seg)
-                cout = f"prev_{i+1}.wav"
-                seg.export(cout, format="wav")
-                _chunk_audios.append(cout)
+                if use_silence:
+                    try:
+                        seg = effects.strip_silence(
+                            seg, silence_thresh=-45, padding=250)
+                    except: pass
 
-            os.remove(name)
+                if len(seg) > 300:
+                    segments.append(seg)
+                    cout = f"prev_chunk_{i+1}.wav"
+                    seg.export(cout, format="wav")
+                    _chunk_audios.append(cout)
+                else:
+                    errors.append(f"Part {i+1}: output too short ({len(seg)}ms)")
 
-        except Exception as e:
-            errors.append(f"Part {i+1}[{lang}]: {str(e)[:90]}")
+                os.remove(name)
+            except Exception as e:
+                errors.append(f"Part {i+1} audio load: {str(e)[:80]}")
+                if os.path.exists(name): os.remove(name)
+        else:
+            errors.append(f"Part {i+1}[{lang}]: {err_msg[:100] if err_msg else 'unknown'}")
             if os.path.exists(name): os.remove(name)
 
         torch.cuda.empty_cache(); gc.collect()
@@ -788,14 +839,19 @@ def generate_v35(
 
     progress(1.0, desc="✅ Done!")
 
-    status  = f"✅ {len(segments)}/{total} parts generated\n"
-    status += f"⏱ Duration: {len(combined)/1000:.1f}s\n"
+    success_count = len(segments)
+    status  = f"{'✅' if success_count==total else '⚠️'} {success_count}/{total} parts generated\n"
+    status += f"⏱ Duration: {len(combined)/1000:.1f}s ({len(combined)/60000:.1f} min)\n"
     status += f"🎵 Format: {fmt.upper()} | Speed: {speed_s:.2f}x\n"
     status += f"🎭 Emotion: {emotion_mode}\n"
     if pitch_shift_enable:
         status += f"🎵 Pitch: {float(pitch_semitones):+.1f} semitones\n"
     if errors:
-        status += f"\n⚠️ {len(errors)} errors:\n" + "\n".join(errors[:3])
+        status += f"\n⚠️ {len(errors)} part(s) failed:\n"
+        for e in errors[:5]:
+            status += f"  • {e}\n"
+        if success_count < total:
+            status += "\n💡 Tip: Dobara generate karo — failed parts retry honge"
 
     chunk_choices = [f"Part {i+1}" for i in range(len(_chunk_audios))]
     return final, status, ref_quality, gr.update(choices=chunk_choices, value=None)
@@ -968,7 +1024,7 @@ with gr.Blocks(css=CSS, title="शिव AI v3.5") as demo:
 
                     with gr.Accordion("🎛️ EQ — Bass / Mid / Treble", open=True):
                         bass_sl   = gr.Slider(minimum=-6.0, maximum=12.0, value=5.0, step=0.5,
-                                              label="🔊 Bass Boost dB (4-6 rec.)")
+                                              label="🔊 Bass Boost dB — default +5 (kam karna ho to slider left)")
                         mid_sl    = gr.Slider(minimum=-6.0, maximum=6.0,  value=0.0, step=0.5,
                                               label="🎵 Mid dB")
                         treble_sl = gr.Slider(minimum=-9.0, maximum=3.0,  value=-2.0, step=0.5,
