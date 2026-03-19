@@ -238,14 +238,34 @@ def number_to_hindi_words(num_str):
         return s
 
 def convert_all_numbers(text):
-    """Sabhi numbers — integers, decimals, percentages — Hindi mein"""
+    """Sabhi numbers — integers, decimals, percentages, ordinals — Hindi mein"""
+
+    # Ordinals pehle (5वीं, 9वें, 3रा, 2री etc.) — XTTS crash karta hai inpe
+    ordinal_map = {
+        '1ला':'पहला', '1ली':'पहली', '1ले':'पहले',
+        '2रा':'दूसरा', '2री':'दूसरी', '2रे':'दूसरे',
+        '3रा':'तीसरा', '3री':'तीसरी', '3रे':'तीसरे',
+        '4था':'चौथा', '4थी':'चौथी', '4थे':'चौथे',
+        '5वाँ':'पाँचवाँ', '5वीं':'पाँचवीं', '5वें':'पाँचवें',
+        '6वाँ':'छठवाँ', '6वीं':'छठवीं', '6वें':'छठवें',
+        '7वाँ':'सातवाँ', '7वीं':'सातवीं', '7वें':'सातवें',
+        '8वाँ':'आठवाँ', '8वीं':'आठवीं', '8वें':'आठवें',
+        '9वाँ':'नौवाँ', '9वीं':'नौवीं', '9वें':'नौवें',
+        '10वाँ':'दसवाँ', '10वीं':'दसवीं', '10वें':'दसवें',
+        '11वाँ':'ग्यारहवाँ', '12वाँ':'बारहवाँ',
+        '20वाँ':'बीसवाँ', '25वाँ':'पच्चीसवाँ',
+        '100वाँ':'सौवाँ',
+    }
+    for src, tgt in ordinal_map.items():
+        text = text.replace(src, tgt)
+
     # Percentage pehle
     text = re.sub(r'(\d+(?:\.\d+)?)%',
                   lambda m: number_to_hindi_words(m.group(0)), text)
     # Decimal numbers
     text = re.sub(r'(\d+\.\d+)',
                   lambda m: number_to_hindi_words(m.group(0)), text)
-    # Pure integers (2+ digits = full convert, 1 digit = ones map)
+    # Pure integers
     text = re.sub(r'\b(\d+)\b',
                   lambda m: number_to_hindi_words(m.group(0)), text)
     return text
@@ -269,33 +289,17 @@ def apply_all_dicts(text, custom_dict):
     return text
 
 def clean_punctuation(text):
-    """
-    HAKLAHAT + LAHRAANA FIX:
-    - ?, !, ., । ke baad PAUSE dalo (XTTS pause samjhega)
-    - ... ellipsis = lamba pause
-    - Unwanted chars hatao
-    """
-    # Ellipsis → lamba pause
-    text = re.sub(r'\.\.\.[\s]*', '। ', text)
-    # Question mark — XTTS confuse hota hai, replace karo pause se
-    # (Yahi haklahat ka ek bada karan tha)
-    text = re.sub(r'\?[\s]*', '। ', text)
-    # Exclamation → pause
-    text = re.sub(r'![\s]*', '! ', text)
-    # Full stop / devanagari purnaviram → pause with space
-    text = re.sub(r'([।\.])([^\s])', r'\1 \2', text)
+    """Punctuation → XTTS-friendly pause + newline handling"""
+    text = re.sub(r'\n+', '। ', text)          # newlines → pause
+    text = re.sub(r'\.\.\.\s*', '। ', text)  # ellipsis → pause
+    text = re.sub(r'\?\s*', '। ', text)         # ? → pause
+    text = re.sub(r'!\s*', '! ', text)
     text = re.sub(r'[।\.]\s*', '। ', text)
-    # Comma → natural pause
     text = re.sub(r'[,،]\s*', ', ', text)
-    # Dash → comma pause
     text = re.sub(r'[-–—]+', ', ', text)
-    # Colon / semicolon → comma
     text = re.sub(r'[;:]', ', ', text)
-    # Remove special chars
     text = re.sub(r'["""\'\'()\[\]{}*#@&^~`|<>]', '', text)
-    # Multiple spaces → single
     text = re.sub(r'\s+', ' ', text)
-    # Multiple pauses → single
     text = re.sub(r'(।\s*){2,}', '। ', text)
     return text.strip()
 
@@ -365,7 +369,8 @@ def language_aware_chunker(text, max_words=30):
     - Pure English chunk tabhi jab koi Hindi nahi
     """
     # Pause markers pe split karo
-    sentences = re.split(r'(?<=[।])\s+', text.strip())
+    # Split on pause markers AND newlines
+    sentences = re.split(r'(?<=[।])\s+|\n+', text.strip())
     # Agar sentence abhi bhi bada hai to comma pe bhi split karo
     final_sentences = []
     for s in sentences:
@@ -880,6 +885,7 @@ def generate_v35(
         if success and os.path.exists(name):
             try:
                 seg = AudioSegment.from_wav(name)
+                seg_dur = len(seg)
 
                 if use_silence:
                     try:
@@ -887,23 +893,39 @@ def generate_v35(
                             seg, silence_thresh=-45, padding=250)
                     except: pass
 
-                if len(seg) > 300:
+                # Min 200ms accept karo (pehle 300ms tha — chhote lines miss ho rahi thi)
+                if len(seg) > 200:
                     segments.append(seg)
                     cout = f"prev_chunk_{i+1}.wav"
                     seg.export(cout, format="wav")
                     _chunk_audios.append(cout)
+                    print(f"Part {i+1}: OK ({seg_dur}ms)")
                 else:
-                    errors.append(f"Part {i+1}: output too short ({len(seg)}ms)")
+                    # Too short — original bina silence-strip ke use karo
+                    seg2 = AudioSegment.from_wav(name) if os.path.exists(name) else seg
+                    if len(seg2) > 100:
+                        segments.append(seg2)
+                        cout = f"prev_chunk_{i+1}.wav"
+                        seg2.export(cout, format="wav")
+                        _chunk_audios.append(cout)
+                        print(f"Part {i+1}: short but accepted ({len(seg2)}ms)")
+                    else:
+                        errors.append(f"Part {i+1}: too short ({seg_dur}ms) — skipped")
 
-                os.remove(name)
+                if os.path.exists(name): os.remove(name)
             except Exception as e:
-                errors.append(f"Part {i+1} audio load: {str(e)[:80]}")
+                errors.append(f"Part {i+1} load error: {str(e)[:80]}")
                 if os.path.exists(name): os.remove(name)
         else:
-            errors.append(f"Part {i+1}[{lang}]: {err_msg[:100] if err_msg else 'unknown'}")
+            err_detail = err_msg[:100] if err_msg else "unknown"
+            errors.append(f"Part {i+1}[{lang}]: {err_detail}")
+            print(f"Part {i+1} FAILED: {err_detail}")
             if os.path.exists(name): os.remove(name)
 
-        torch.cuda.empty_cache(); gc.collect()
+        # Memory clear
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     if not segments:
         err_detail = "\n".join(errors[:8]) if errors else "Unknown"
