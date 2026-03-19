@@ -686,46 +686,46 @@ def generate_v35(
     # Chunking — 40 words max (chhote = less stutter)
     progress(0.08, desc="✂️ Smart chunking...")
     chunks = language_aware_chunker(p_text, max_words=35)
-    # Long audio estimate
-    est_minutes = len(chunks) * 0.4  # ~24sec per chunk on GPU
-    progress(0.09, desc=f"📊 Total {total} parts — ~{est_minutes:.0f} min GPU time")
-    total  = len(chunks)
+    total = len(chunks)   # PEHLE define karo
     if total == 0:
-        return None, "❌ Text empty after processing.", ref_quality, gr.update(choices=[])
+        return None, "Text empty after processing.", ref_quality, gr.update(choices=[])
+    est_minutes = total * 0.4
+    progress(0.09, desc=f"Total {total} parts — approx {est_minutes:.0f} min")
 
     segments, errors = [], []
 
-    def safe_set_tts_params(temperature, rep_pen, gpt_cond_len):
-        """XTTS v2 params safely set karo — crash nahi hoga"""
-        safe_temp = min(float(temperature), 0.30)
-        # Method 1: synthesizer path (XTTS v2.0.x)
+    # All params explicitly pass karo — no closure/scope issues
+    _temperature  = float(temperature)
+    _rep_pen      = float(rep_pen)
+    _gpt_cond_len = int(gpt_cond_len)
+    _preset_speed = float(preset["speed"])
+
+    def safe_set_params():
+        """XTTS params set karo — 3 methods try karo"""
+        safe_temp = min(_temperature, 0.30)
         try:
             cfg = tts.synthesizer.tts_config.model_args
             cfg.temperature        = safe_temp
-            cfg.repetition_penalty = float(rep_pen)
-            cfg.gpt_cond_len       = int(gpt_cond_len)
+            cfg.repetition_penalty = _rep_pen
+            cfg.gpt_cond_len       = _gpt_cond_len
             cfg.length_penalty     = 1.0
             cfg.top_p              = 0.80
             return
         except: pass
-        # Method 2: direct model config (XTTS v2.1.x)
         try:
-            cfg = tts.tts_config
-            cfg.temperature = safe_temp
+            tts.tts_config.temperature = safe_temp
             return
         except: pass
-        # Method 3: synthesizer directly
         try:
             tts.synthesizer.temperature = safe_temp
         except: pass
 
-    def generate_one_chunk(chunk_text, lang, out_path, speed):
-        """Ek chunk generate karo — retry ke saath"""
-        for attempt in range(2):  # 2 attempts
+    def generate_one_chunk(chunk_text, lang, out_path, speed_val):
+        """Ek chunk generate karo — retry logic ke saath"""
+        actual_speed = float(speed_val) if float(speed_val) >= 0.8 else _preset_speed
+        for attempt in range(2):
             try:
-                safe_set_tts_params(temperature, rep_pen, gpt_cond_len)
-                # 0 = emotion preset ki speed use karo
-                actual_speed = float(speed) if float(speed) >= 0.8 else preset["speed"]
+                safe_set_params()
                 tts.tts_to_file(
                     text=chunk_text,
                     speaker_wav=ref,
@@ -735,24 +735,23 @@ def generate_v35(
                 )
                 return True, None
             except Exception as e:
-                err = str(e)
                 if attempt == 0:
-                    # First fail: retry with simpler settings
-                    torch.cuda.empty_cache(); gc.collect()
+                    torch.cuda.empty_cache()
+                    gc.collect()
                     try:
-                        # Fallback: no extra params, just basic call
+                        # Fallback: simplest possible call
                         tts.tts_to_file(
                             text=chunk_text,
                             speaker_wav=ref,
-                            language="hi",  # force Hindi on retry
+                            language="hi",
                             file_path=out_path,
-                            speed=0.97,
+                            speed=_preset_speed,
                         )
                         return True, None
                     except Exception as e2:
-                        err = str(e2)
+                        err2 = str(e2)
                 else:
-                    return False, err
+                    return False, str(e)
         return False, "Max retries reached"
 
     for i, (chunk, lang) in enumerate(chunks):
