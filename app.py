@@ -32,8 +32,8 @@ os.environ["COQUI_TOS_AGREED"] = "1"
 torch.backends.cudnn.benchmark = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-REPO_ID   = "Shriramnag/My-Shriram-Voice"
-G_RAW     = "https://raw.githubusercontent.com/shriramnag/Aivoicebox/main/%F0%9F%93%81%20voices/"
+REPO_ID   = "shriramnag/My-Shriram-Voice"
+G_RAW     = "https://raw.githubusercontent.com/shriramnag/Shiv-AI-Voice/main/voices/"
 DICT_FILE = "custom_dict.json"
 
 print("🚩 शिव AI v3.5 — Advanced Voice Match Engine...")
@@ -994,7 +994,7 @@ with gr.Blocks(css=CSS, title="शिव AI v3.5") as demo:
                                 up2 = gr.Audio(label="Clip 2", type="filepath")
                                 up3 = gr.Audio(label="Clip 3", type="filepath")
                         git_v = gr.Dropdown(
-                            choices=["aideva.wav"],
+                            choices=["aideva.wav", "voice1.wav", "voice2.wav"],
                             label="🎵 Default Voice (upload na karo tab)",
                             value="aideva.wav"
                         )
