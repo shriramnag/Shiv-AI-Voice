@@ -63,6 +63,33 @@ except:
 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 print(f"✅ Ready on {device.upper()}")
 
+# ── Startup pe default voices download karo ──
+def download_default_voices():
+    """App start hote hi sabhi default voices download karo"""
+    os.makedirs("voices", exist_ok=True)
+    voice_files = ["aideva.wav", "Joanne.wav", "Reginald voice.wav", "cloning .wav"]
+    for vf in voice_files:
+        local = os.path.join("voices", vf)
+        if os.path.exists(local) and os.path.getsize(local) > 1000:
+            print(f"Voice cached: {vf}")
+            continue
+        url = G_RAW + requests.utils.quote(vf)
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(local, "wb") as f:
+                    f.write(r.content)
+                print(f"Downloaded: {vf} ({len(r.content)//1024}KB)")
+            else:
+                print(f"Skip {vf}: HTTP {r.status_code}")
+        except Exception as e:
+            print(f"Could not download {vf}: {e}")
+
+try:
+    download_default_voices()
+except Exception as e:
+    print(f"Voice download warning: {e}")
+
 # librosa optional (pitch shift ke liye)
 try:
     import librosa
@@ -691,45 +718,69 @@ def generate_v35(
         raw = "ref_dl.wav"
         ref = None
 
-        # Sabhi possible URLs try karo — GitHub + HuggingFace
-        urls_to_try = [
-            # GitHub voices folder
-            G_RAW + requests.utils.quote(git_ref),
-            # HuggingFace model repo
-            f"https://huggingface.co/Shriramnag/My-Shriram-Voice/resolve/main/{requests.utils.quote(git_ref)}",
-            # HuggingFace alternate path
-            f"https://huggingface.co/shriramnag/My-Shriram-Voice/resolve/main/{requests.utils.quote(git_ref)}",
-        ]
-
         last_error = ""
-        for try_url in urls_to_try:
-            try:
-                resp = requests.get(try_url, timeout=30)
-                if resp.status_code == 200 and len(resp.content) > 1000:
-                    with open(raw, "wb") as f:
-                        f.write(resp.content)
-                    ref = prepare_reference(raw)
-                    print(f"Downloaded from: {try_url}")
-                    break
-            except Exception as e:
-                last_error = str(e)
-                continue
+        # Step 1: local file check
+        local_voice = os.path.join("voices", git_ref)
+        if os.path.exists(local_voice) and os.path.getsize(local_voice) > 1000:
+            ref = prepare_reference(local_voice)
+            print(f"Using local: {local_voice}")
 
-        # Fallback: agar koi bhi URL kaam nahi kiya
-        # to locally downloaded Ramai.pth ke paas jo bhi .wav hai use karo
+        # Step 2: download agar local nahi hai
         if not ref:
-            for fallback in ["Ramai.wav", "ref_ready.wav", "ref_dl.wav"]:
+            urls_to_try = [
+                G_RAW + requests.utils.quote(git_ref),
+                f"https://huggingface.co/Shriramnag/My-Shriram-Voice/resolve/main/{requests.utils.quote(git_ref)}",
+            ]
+            for try_url in urls_to_try:
+                try:
+                    resp = requests.get(try_url, timeout=30)
+                    if resp.status_code == 200 and len(resp.content) > 1000:
+                        with open(raw, "wb") as fh:
+                            fh.write(resp.content)
+                        # Cache for next time
+                        with open(local_voice, "wb") as fh:
+                            fh.write(resp.content)
+                        ref = prepare_reference(raw)
+                        print(f"Downloaded & cached: {try_url}")
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+
+        # Fallback 1: local cached files
+        if not ref:
+            for fallback in ["ref_ready.wav", "ref_dl.wav", "Ramai.wav"]:
                 if os.path.exists(fallback) and os.path.getsize(fallback) > 1000:
                     ref = prepare_reference(fallback)
                     print(f"Using local fallback: {fallback}")
                     break
 
+        # Fallback 2: voices folder se koi bhi wav
+        if not ref:
+            for fname in ["aideva.wav", "Joanne.wav", "cloning .wav", "Reginald voice.wav"]:
+                local_path = os.path.join("voices", fname)
+                if os.path.exists(local_path):
+                    ref = prepare_reference(local_path)
+                    print(f"Using voices folder: {local_path}")
+                    break
+
+        # Fallback 3: content folder mein koi bhi wav
+        if not ref:
+            import glob
+            wavs = glob.glob("/content/**/*.wav", recursive=True)
+            wavs += glob.glob("**/*.wav", recursive=True)
+            for w in wavs:
+                if os.path.getsize(w) > 5000:
+                    ref = prepare_reference(w)
+                    print(f"Found wav: {w}")
+                    break
+
         if not ref:
             msg = (
-                "Reference audio download failed.\n"
-                f"Tried: {git_ref} on GitHub and HuggingFace\n"
-                "FIX: Apni awaaz ko 'Main Clip' mein upload karein (6-20 sec)\n"
-                f"Last error: {last_error[:100]}"
+                "Reference audio nahi mila!\n"
+                f"GitHub pe try kiya: voices/{git_ref}\n"
+                "SOLUTION: 'Main Clip' section mein apni awaaz upload karein (6-20 sec WAV/MP3)\n"
+                f"Last error: {last_error[:80]}"
             )
             return None, msg, "", gr.update(choices=[])
 
@@ -773,60 +824,43 @@ def generate_v35(
         except: pass
 
     def generate_one_chunk(chunk_text, lang, out_path, speed_val):
-        """Ek chunk generate karo — 3 attempts + CUDA memory fix"""
+        """Ek chunk generate — fast, no sleep, 2 attempts"""
         actual_speed = float(speed_val) if float(speed_val) >= 0.8 else _preset_speed
 
-        # Attempt 1: Normal + aggressive memory clear
+        # Attempt 1: Normal
         try:
-            # CUDA OOM fix: aggressive cleanup pehle
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
             gc.collect()
-            import time; time.sleep(0.5)  # GPU ko settle karne do
             safe_set_params()
             tts.tts_to_file(
                 text=chunk_text, speaker_wav=ref,
                 language=lang, file_path=out_path, speed=actual_speed,
             )
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 500:
                 return True, None
         except Exception as e1:
-            err_str = str(e1).lower()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
-            import time; time.sleep(1.0)
 
-        # Attempt 2: Hindi force + chhota text
+        # Attempt 2: Force Hindi, shorter text
         try:
-            torch.cuda.empty_cache(); gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             words = chunk_text.split()
-            short = " ".join(words[:20]) if len(words) > 20 else chunk_text
+            fallback_text = " ".join(words[:15]) if len(words) > 15 else chunk_text
             tts.tts_to_file(
-                text=short, speaker_wav=ref,
-                language="hi", file_path=out_path, speed=0.95,
-            )
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                return True, None
-        except Exception as e2:
-            torch.cuda.empty_cache(); gc.collect()
-
-        # Attempt 3: Very short fallback
-        try:
-            torch.cuda.empty_cache(); gc.collect()
-            words = chunk_text.split()
-            tiny = " ".join(words[:10]) if len(words) > 10 else chunk_text
-            tts.tts_to_file(
-                text=tiny, speaker_wav=ref,
+                text=fallback_text, speaker_wav=ref,
                 language="hi", file_path=out_path, speed=0.95,
             )
             if os.path.exists(out_path) and os.path.getsize(out_path) > 500:
                 return True, None
-        except Exception as e3:
-            return False, str(e3)[:80]
+        except Exception as e2:
+            return False, str(e2)[:100]
 
-        return False, "All 3 attempts failed"
+        return False, "Both attempts failed"
 
     for i, (chunk, lang) in enumerate(chunks):
         progress(
@@ -872,11 +906,23 @@ def generate_v35(
         torch.cuda.empty_cache(); gc.collect()
 
     if not segments:
-        return None, f"❌ Generate nahi hua.\n{chr(10).join(errors[:5])}", ref_quality, gr.update(choices=[])
+        err_detail = "\n".join(errors[:8]) if errors else "Unknown"
+        return None, (
+            f"Koi bhi chunk generate nahi hua ({total} try kiye)\n"
+            f"Errors:\n{err_detail}\n\n"
+            "FIX: Apni awaaz 'Main Clip' mein upload karein"
+        ), ref_quality, gr.update(choices=[])
 
-    # Join
-    progress(0.83, desc="🔗 Crossfade join...")
+    # All segments ko join karo
+    progress(0.83, desc=f"Joining {len(segments)} parts...")
+    print(f"Joining {len(segments)} segments, total words processed")
+
+    # Individual segment durations log karo
+    total_dur = sum(len(s) for s in segments)
+    print(f"Total audio before join: {total_dur/1000:.1f}s")
+
     combined = crossfade_join(segments, cf_ms=60)
+    print(f"After join: {len(combined)/1000:.1f}s")
 
     # Normalize
     if use_normalize:
