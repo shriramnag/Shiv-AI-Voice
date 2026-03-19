@@ -40,6 +40,23 @@ print("🚩 शिव AI v3.5 — Advanced Voice Match Engine...")
 try:
     hf_hub_download(repo_id=REPO_ID, filename="Ramai.pth")
     hf_hub_download(repo_id=REPO_ID, filename="config.json")
+    # Voice sample bhi download karo — default reference ke liye
+    try:
+        import shutil
+        wav_path = hf_hub_download(repo_id=REPO_ID, filename="Ramai.wav")
+        shutil.copy(wav_path, "Ramai.wav")
+        print("Voice sample Ramai.wav ready")
+    except:
+        # HuggingFace pe nahi hai to GitHub se try karo
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(
+                "https://raw.githubusercontent.com/shriramnag/Shiv-AI-Voice/main/voices/Ramai.wav",
+                "Ramai.wav"
+            )
+            print("Ramai.wav downloaded from GitHub")
+        except:
+            pass
 except:
     pass
 
@@ -313,7 +330,7 @@ def detect_chunk_language(words):
         return "en"
     return "hi"  # Default always hi — mixed text ke liye bhi
 
-def language_aware_chunker(text, max_words=35):
+def language_aware_chunker(text, max_words=30):
     """
     STUTTER FIX:
     - max_words 35 (pehle 45 tha — zyada words = zyada stutter)
@@ -672,20 +689,55 @@ def generate_v35(
             ref = prepare_reference(refs_uploaded[0])
     else:
         raw = "ref_dl.wav"
-        url = G_RAW + requests.utils.quote(git_ref)
-        try:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            with open(raw,"wb") as f: f.write(resp.content)
-            ref = prepare_reference(raw)
-        except Exception as e:
-            return None, f"❌ Download failed: {e}", "", gr.update(choices=[])
+        ref = None
+
+        # Sabhi possible URLs try karo — GitHub + HuggingFace
+        urls_to_try = [
+            # GitHub voices folder
+            G_RAW + requests.utils.quote(git_ref),
+            # HuggingFace model repo
+            f"https://huggingface.co/Shriramnag/My-Shriram-Voice/resolve/main/{requests.utils.quote(git_ref)}",
+            # HuggingFace alternate path
+            f"https://huggingface.co/shriramnag/My-Shriram-Voice/resolve/main/{requests.utils.quote(git_ref)}",
+        ]
+
+        last_error = ""
+        for try_url in urls_to_try:
+            try:
+                resp = requests.get(try_url, timeout=30)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    with open(raw, "wb") as f:
+                        f.write(resp.content)
+                    ref = prepare_reference(raw)
+                    print(f"Downloaded from: {try_url}")
+                    break
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        # Fallback: agar koi bhi URL kaam nahi kiya
+        # to locally downloaded Ramai.pth ke paas jo bhi .wav hai use karo
+        if not ref:
+            for fallback in ["Ramai.wav", "ref_ready.wav", "ref_dl.wav"]:
+                if os.path.exists(fallback) and os.path.getsize(fallback) > 1000:
+                    ref = prepare_reference(fallback)
+                    print(f"Using local fallback: {fallback}")
+                    break
+
+        if not ref:
+            msg = (
+                "Reference audio download failed.\n"
+                f"Tried: {git_ref} on GitHub and HuggingFace\n"
+                "FIX: Apni awaaz ko 'Main Clip' mein upload karein (6-20 sec)\n"
+                f"Last error: {last_error[:100]}"
+            )
+            return None, msg, "", gr.update(choices=[])
 
     ref_quality = check_ref_quality(ref)
 
     # Chunking — 40 words max (chhote = less stutter)
     progress(0.08, desc="✂️ Smart chunking...")
-    chunks = language_aware_chunker(p_text, max_words=35)
+    chunks = language_aware_chunker(p_text, max_words=30)
     total = len(chunks)   # PEHLE define karo
     if total == 0:
         return None, "Text empty after processing.", ref_quality, gr.update(choices=[])
@@ -721,43 +773,73 @@ def generate_v35(
         except: pass
 
     def generate_one_chunk(chunk_text, lang, out_path, speed_val):
-        """Ek chunk generate karo — retry logic ke saath"""
+        """Ek chunk generate karo — 3 attempts + CUDA memory fix"""
         actual_speed = float(speed_val) if float(speed_val) >= 0.8 else _preset_speed
-        for attempt in range(2):
-            try:
-                safe_set_params()
-                tts.tts_to_file(
-                    text=chunk_text,
-                    speaker_wav=ref,
-                    language=lang,
-                    file_path=out_path,
-                    speed=actual_speed,
-                )
+
+        # Attempt 1: Normal + aggressive memory clear
+        try:
+            # CUDA OOM fix: aggressive cleanup pehle
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+            import time; time.sleep(0.5)  # GPU ko settle karne do
+            safe_set_params()
+            tts.tts_to_file(
+                text=chunk_text, speaker_wav=ref,
+                language=lang, file_path=out_path, speed=actual_speed,
+            )
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
                 return True, None
-            except Exception as e:
-                if attempt == 0:
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    try:
-                        # Fallback: simplest possible call
-                        tts.tts_to_file(
-                            text=chunk_text,
-                            speaker_wav=ref,
-                            language="hi",
-                            file_path=out_path,
-                            speed=_preset_speed,
-                        )
-                        return True, None
-                    except Exception as e2:
-                        err2 = str(e2)
-                else:
-                    return False, str(e)
-        return False, "Max retries reached"
+        except Exception as e1:
+            err_str = str(e1).lower()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            import time; time.sleep(1.0)
+
+        # Attempt 2: Hindi force + chhota text
+        try:
+            torch.cuda.empty_cache(); gc.collect()
+            words = chunk_text.split()
+            short = " ".join(words[:20]) if len(words) > 20 else chunk_text
+            tts.tts_to_file(
+                text=short, speaker_wav=ref,
+                language="hi", file_path=out_path, speed=0.95,
+            )
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                return True, None
+        except Exception as e2:
+            torch.cuda.empty_cache(); gc.collect()
+
+        # Attempt 3: Very short fallback
+        try:
+            torch.cuda.empty_cache(); gc.collect()
+            words = chunk_text.split()
+            tiny = " ".join(words[:10]) if len(words) > 10 else chunk_text
+            tts.tts_to_file(
+                text=tiny, speaker_wav=ref,
+                language="hi", file_path=out_path, speed=0.95,
+            )
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 500:
+                return True, None
+        except Exception as e3:
+            return False, str(e3)[:80]
+
+        return False, "All 3 attempts failed"
 
     for i, (chunk, lang) in enumerate(chunks):
-        progress((i+1)/total*0.82, desc=f"🎙️ Part {i+1}/{total} [{lang.upper()}] — {len(chunk.split())} words")
-        # Unique filename per chunk — overwrite nahi hoga
-        name = f"shiv_chunk_{i}_{id(chunk) % 9999}.wav"
+        progress(
+            (i+1)/total*0.82,
+            desc=f"Part {i+1}/{total} [{lang.upper()}] — {len(chunk.split())} words"
+        )
+        # Unique filename — overwrite nahi hoga
+        name = f"shiv_chunk_{i}_{i*7+13}.wav"
+
+        # Har 3 chunks pe CUDA memory fully clear karo (long audio ke liye)
+        if i > 0 and i % 3 == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
 
         success, err_msg = generate_one_chunk(chunk, lang, name, speed_s)
 
@@ -840,18 +922,26 @@ def generate_v35(
     progress(1.0, desc="✅ Done!")
 
     success_count = len(segments)
-    status  = f"{'✅' if success_count==total else '⚠️'} {success_count}/{total} parts generated\n"
-    status += f"⏱ Duration: {len(combined)/1000:.1f}s ({len(combined)/60000:.1f} min)\n"
-    status += f"🎵 Format: {fmt.upper()} | Speed: {speed_s:.2f}x\n"
-    status += f"🎭 Emotion: {emotion_mode}\n"
+    dur_sec = len(combined) / 1000
+    dur_min = dur_sec / 60
+
+    ok = "OK" if success_count == total else "PARTIAL"
+    status  = f"{ok}: {success_count}/{total} parts generated\n"
+    status += f"Duration: {dur_sec:.1f}s ({dur_min:.1f} min)\n"
+    status += f"Format: {fmt.upper()} | Speed: {speed_s:.2f}x\n"
+    status += f"Emotion: {emotion_mode}\n"
+    if dur_min < 1 and total > 3:
+        status += "\nWARNING: Output bahut chhota hai!\n"
+        status += "Reason: Chunks fail ho rahe hain\n"
+        status += "Fix: Apni awaaz 'Main Clip' mein upload karein\n"
     if pitch_shift_enable:
-        status += f"🎵 Pitch: {float(pitch_semitones):+.1f} semitones\n"
+        status += f"Pitch: {float(pitch_semitones):+.1f} semitones\n"
     if errors:
-        status += f"\n⚠️ {len(errors)} part(s) failed:\n"
+        status += f"\nFailed {len(errors)} parts:\n"
         for e in errors[:5]:
-            status += f"  • {e}\n"
+            status += f"  - {e}\n"
         if success_count < total:
-            status += "\n💡 Tip: Dobara generate karo — failed parts retry honge"
+            status += "\nTip: Dobara generate karo ya apni awaaz upload karo"
 
     chunk_choices = [f"Part {i+1}" for i in range(len(_chunk_audios))]
     return final, status, ref_quality, gr.update(choices=chunk_choices, value=None)
@@ -997,9 +1087,17 @@ with gr.Blocks(css=CSS, title="शिव AI v3.5") as demo:
                                 up2 = gr.Audio(label="Clip 2", type="filepath")
                                 up3 = gr.Audio(label="Clip 3", type="filepath")
                         git_v = gr.Dropdown(
-                            choices=["aideva.wav", "voice1.wav", "voice2.wav"],
-                            label="🎵 Default Voice (upload na karo tab)",
+                            choices=[
+                                "aideva.wav",
+                                "Joanne.wav",
+                                "Reginald voice.wav",
+                                "cloning .wav",
+                            ],
+                            label="Default Voice — GitHub se (ya apni awaaz upload karo upar)",
                             value="aideva.wav"
+                        )
+                        gr.Markdown(
+                            "*Apni awaaz Main Clip mein upload karo — best voice match milega*"
                         )
 
                     with gr.Accordion("🎭 Emotion / Style", open=True):
