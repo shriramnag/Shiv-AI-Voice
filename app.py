@@ -724,7 +724,8 @@ def generate_v35(
         for attempt in range(2):  # 2 attempts
             try:
                 safe_set_tts_params(temperature, rep_pen, gpt_cond_len)
-                actual_speed = float(speed) if float(speed) > 0 else 0.97
+                # 0 = emotion preset ki speed use karo
+                actual_speed = float(speed) if float(speed) >= 0.8 else preset["speed"]
                 tts.tts_to_file(
                     text=chunk_text,
                     speaker_wav=ref,
@@ -988,7 +989,10 @@ with gr.Blocks(css=CSS, title="शिव AI v3.5") as demo:
                             interactive=False, lines=3,
                             elem_classes=["status-out"]
                         )
-                        up1.change(check_ref_quality, [up1], [ref_qual])
+                        up1.change(
+                            lambda f: check_ref_quality(f) if f else "📤 Pehle audio upload karein",
+                            [up1], [ref_qual]
+                        )
                         with gr.Accordion("➕ Extra Clips (optional — better match ke liye)", open=False):
                             with gr.Row():
                                 up2 = gr.Audio(label="Clip 2", type="filepath")
@@ -1005,8 +1009,8 @@ with gr.Blocks(css=CSS, title="शिव AI v3.5") as demo:
                             value="😊 सामान्य (Normal)",
                             label="Tone"
                         )
-                        spd = gr.Slider(minimum=0.8, maximum=1.4, value=0.0, step=0.05,
-                                        label="Speed Override (0 = emotion preset)")
+                        spd = gr.Slider(minimum=0.0, maximum=1.4, value=0.0, step=0.05,
+                                        label="Speed Override (0 = emotion preset speed use hogi)")
                         emotion.change(apply_emotion, [emotion], [spd])
 
                     with gr.Accordion("🎵 Voice Match Settings", open=True):
