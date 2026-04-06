@@ -62,32 +62,21 @@ except:
 
 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 
-# ── GPU Speed Turbo Mode ──
+# ── GPU Speed — safe optimizations only ──
 if torch.cuda.is_available():
     try:
-        # Half precision — 2x faster on T4/A100
-        tts.synthesizer.tts_model = tts.synthesizer.tts_model.half()
-        print("GPU Turbo: FP16 (half precision) active — 2x speed")
-    except:
-        pass
-    try:
-        # cuDNN benchmark — fastest convolution algorithm auto-select
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
         print("GPU Turbo: cuDNN benchmark active")
     except:
         pass
     try:
-        # torch.compile — PyTorch 2.0+ graph optimization
-        import torch._dynamo
-        tts.synthesizer.tts_model = torch.compile(
-            tts.synthesizer.tts_model,
-            mode="reduce-overhead",   # best for repeated same-size inputs
-            fullgraph=False
-        )
-        print("GPU Turbo: torch.compile active — 4x speed boost")
-    except Exception as e:
-        print(f"torch.compile skip: {e}")
+        # TF32 — Ampere GPU pe 2x speedup, no quality loss
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("GPU Turbo: TF32 active")
+    except:
+        pass
 
 print(f"✅ Ready on {device.upper()}")
 
@@ -101,17 +90,27 @@ def download_default_voices():
         if os.path.exists(local) and os.path.getsize(local) > 1000:
             print(f"Voice cached: {vf}")
             continue
-        url = G_RAW + requests.utils.quote(vf)
-        try:
-            r = requests.get(url, timeout=20)
-            if r.status_code == 200 and len(r.content) > 1000:
-                with open(local, "wb") as f:
-                    f.write(r.content)
-                print(f"Downloaded: {vf} ({len(r.content)//1024}KB)")
-            else:
-                print(f"Skip {vf}: HTTP {r.status_code}")
-        except Exception as e:
-            print(f"Could not download {vf}: {e}")
+        # Spaces ko %20 mein encode karo — GitHub raw URL ke liye zaroori
+        encoded = requests.utils.quote(vf, safe="")
+        urls = [
+            G_RAW + encoded,
+            # Alternate: without encoding (some servers need it plain)
+            G_RAW + vf.replace(" ", "%20"),
+        ]
+        downloaded = False
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=20)
+                if r.status_code == 200 and len(r.content) > 1000:
+                    with open(local, "wb") as f:
+                        f.write(r.content)
+                    print(f"Downloaded: {vf} ({len(r.content)//1024}KB)")
+                    downloaded = True
+                    break
+            except Exception as e:
+                continue
+        if not downloaded:
+            print(f"Skip {vf}: not available (upload kar sakte hain manually)")
 
 try:
     download_default_voices()
@@ -1145,132 +1144,171 @@ HEADER = """
 </div>
 """
 
-with gr.Blocks(css=CSS, title="शिव AI v4.0 Turbo") as demo:
+with gr.Blocks(css=CSS, title="Shiv AI v4.0") as demo:
 
     gr.HTML(HEADER)
 
     with gr.Tabs():
 
         # ═══ TAB 1: Generate ═══
-        with gr.Tab("🎙️ Generate"):
-            with gr.Row():
+        with gr.Tab("Generate"):
+            with gr.Row(equal_height=False):
 
-                # LEFT — Text
+                # ── LEFT: Script ──
                 with gr.Column(scale=3):
                     txt = gr.Textbox(
-                        label="📝 Script — Hindi / English / Sanskrit",
-                        lines=13,
-                        placeholder="यहाँ script paste करें...\nExample: आज हम Success की बात करेंगे। Dharma ka path follow karo।"
+                        label="Script — Hindi / English / Sanskrit",
+                        lines=16,
+                        placeholder="Yahan script paste karein...\n\nExample:\nAaj hum safalta ki baat karenge।\nDharma aur karma ka path follow karo।"
                     )
                     with gr.Row():
-                        wc  = gr.Markdown("शब्द: **0**")
-                        cc  = gr.Markdown("अक्षर: **0**")
+                        wc = gr.Markdown("Shabd: **0**")
+                        cc = gr.Markdown("Akshar: **0**")
                     txt.change(
-                        lambda x: (f"शब्द: **{len(x.split())}**", f"अक्षर: **{len(x)}**"),
-                        [txt],[wc,cc]
+                        lambda x: (
+                            f"Shabd: **{len(x.split())}**",
+                            f"Akshar: **{len(x)}**"
+                        ),
+                        [txt], [wc, cc]
                     )
-                    with gr.Row():
-                        prev_btn = gr.Button("👁 Text Preview (cleanup dekhein)", size="sm", variant="secondary")
-                    text_preview = gr.Markdown(visible=False)
-                    prev_btn.click(lambda t,cw: (preview_cleaned_text(t,cw), gr.update(visible=True)),
-                                   [txt, gr.State("")], [text_preview, text_preview])
+                    prev_btn = gr.Button(
+                        "Text Preview — cleanup dekhein",
+                        size="sm", variant="secondary"
+                    )
+                    text_preview = gr.Textbox(
+                        label="Cleaned Text", lines=4,
+                        interactive=False, visible=False
+                    )
+                    prev_btn.click(
+                        lambda t: (
+                            full_text_processor(t, load_custom_dict()),
+                            gr.update(visible=True)
+                        ),
+                        [txt], [text_preview, text_preview]
+                    )
 
-                # RIGHT — Controls
+                # ── RIGHT: Controls ──
                 with gr.Column(scale=2):
 
-                    with gr.Accordion("🎤 Apni Awaaz Upload Karo", open=True):
-                        # SINGLE upload — clean UI
-                        up1 = gr.Audio(
-                            label="Awaaz Upload (6-30 sec WAV/MP3 — clear recording)",
-                            type="filepath"
-                        )
-                        ref_qual = gr.Textbox(
-                            label="Quality Check",
-                            interactive=False, lines=3,
-                            elem_classes=["status-out"]
-                        )
-                        up1.change(
-                            lambda f: check_ref_quality(f) if f else "Awaaz upload karo upar",
-                            [up1], [ref_qual]
-                        )
-                        # up2, up3 — hidden variables (backward compat)
-                        up2 = gr.Audio(visible=False, type="filepath")
-                        up3 = gr.Audio(visible=False, type="filepath")
-                        gr.Markdown("*Upload nahi karna to niche se default voice chunein*")
-                        git_v = gr.Dropdown(
-                            choices=["aideva.wav","Joanne.wav","Reginald voice.wav","cloning .wav"],
-                            label="Ya GitHub Default Voice",
-                            value="aideva.wav"
-                        )
+                    # ── Voice Upload ──
+                    gr.Markdown("### Apni Awaaz")
+                    up1 = gr.Audio(
+                        label="Awaaz Upload karein (6-30 sec)",
+                        type="filepath"
+                    )
+                    ref_qual = gr.Textbox(
+                        label="Quality", interactive=False,
+                        lines=2, elem_classes=["status-out"]
+                    )
+                    up1.change(
+                        lambda f: check_ref_quality(f) if f else "Awaaz upload karein",
+                        [up1], [ref_qual]
+                    )
+                    up2 = gr.Audio(visible=False, type="filepath")
+                    up3 = gr.Audio(visible=False, type="filepath")
+                    git_v = gr.Dropdown(
+                        choices=["aideva.wav","Joanne.wav",
+                                 "Reginald voice.wav","cloning .wav"],
+                        label="Ya Default Voice chunein",
+                        value="aideva.wav"
+                    )
 
-                    with gr.Accordion("🎭 Emotion / Style", open=True):
-                        emotion = gr.Radio(
-                            choices=list(EMOTION_PRESETS.keys()),
-                            value="😊 सामान्य (Normal)",
-                            label="Tone"
-                        )
-                        spd = gr.Slider(minimum=0.0, maximum=1.4, value=0.0, step=0.05,
-                                        label="Speed Override (0 = emotion preset speed use hogi)")
-                        emotion.change(apply_emotion, [emotion], [spd])
+                    gr.Markdown("---")
 
-                    with gr.Accordion("🎵 Voice Match Settings", open=True):
-                        gr.Markdown("*Yahan se voice 100% match karo*")
-                        pitch_en = gr.Checkbox(
-                            label="🎵 Pitch Correction (librosa required)", value=False)
-                        pitch_sl = gr.Slider(
-                            minimum=-6.0, maximum=6.0, value=0.0, step=0.5,
-                            label="Pitch Shift (semitones) — negative=neeche, positive=upar"
-                        )
-                        gpt_len = gr.Slider(
-                            minimum=3, maximum=30, value=12, step=1,
-                            label="Voice Match (3=fast, 12=good, 24=best — zyada=slower)"
-                        )
+                    # ── Tone ──
+                    gr.Markdown("### Style / Tone")
+                    emotion = gr.Radio(
+                        choices=list(EMOTION_PRESETS.keys()),
+                        value="😊 सामान्य (Normal)",
+                        label=""
+                    )
+                    spd = gr.Slider(
+                        minimum=0.0, maximum=1.4, value=0.0, step=0.05,
+                        label="Speed (0 = auto)"
+                    )
+                    emotion.change(apply_emotion, [emotion], [spd])
 
-                    with gr.Accordion("🎛️ EQ — Bass / Mid / Treble", open=True):
-                        bass_sl   = gr.Slider(minimum=-6.0, maximum=12.0, value=5.0, step=0.5,
-                                              label="🔊 Bass Boost dB — default +5 (kam karna ho to slider left)")
-                        mid_sl    = gr.Slider(minimum=-6.0, maximum=6.0,  value=0.0, step=0.5,
-                                              label="🎵 Mid dB")
-                        treble_sl = gr.Slider(minimum=-9.0, maximum=3.0,  value=-2.0, step=0.5,
-                                              label="🔆 Treble dB (−2 = less robotic)")
+                    gr.Markdown("---")
 
-                    with gr.Accordion("⚙️ Post-Processing", open=False):
-                        with gr.Row():
-                            sln  = gr.Checkbox(label="🔇 Silence Remove", value=True)
-                            norm = gr.Checkbox(label="🧹 Normalize",       value=True)
-                            eq   = gr.Checkbox(label="🎛️ EQ",             value=True)
-                        with gr.Row():
-                            dess = gr.Checkbox(label="🎤 DeEsser (harsh 's' fix)", value=True)
-                            comp = gr.Checkbox(label="🗜️ Compressor",              value=True)
+                    # ── Voice Match ──
+                    gr.Markdown("### Voice Match")
+                    gpt_len = gr.Slider(
+                        minimum=3, maximum=30, value=12, step=1,
+                        label="Match Quality (12=good, 24=best, slow)"
+                    )
+                    pitch_en = gr.Checkbox(
+                        label="Pitch Correction (librosa)", value=False
+                    )
+                    pitch_sl = gr.Slider(
+                        minimum=-6.0, maximum=6.0, value=0.0, step=0.5,
+                        label="Pitch Shift semitones"
+                    )
 
-                    with gr.Accordion("💾 Output Format", open=False):
-                        out_fmt = gr.Radio(
-                            choices=["wav","mp3","ogg"],
-                            value="wav",
-                            label="Format"
-                        )
+                    gr.Markdown("---")
 
-                    with gr.Accordion("📖 Custom Words (session)", open=False):
-                        custom_raw = gr.Textbox(
-                            label="WORD = उच्चारण (ek per line)",
-                            placeholder="PAISAWALA = पेसावाला\nShriramnag = श्री राम नाग",
-                            lines=3
-                        )
+                    # ── EQ ──
+                    gr.Markdown("### EQ")
+                    bass_sl = gr.Slider(
+                        minimum=-6.0, maximum=12.0, value=5.0, step=0.5,
+                        label="Bass dB (+5 recommended)"
+                    )
+                    mid_sl = gr.Slider(
+                        minimum=-6.0, maximum=6.0, value=0.0, step=0.5,
+                        label="Mid dB"
+                    )
+                    treble_sl = gr.Slider(
+                        minimum=-9.0, maximum=3.0, value=-2.0, step=0.5,
+                        label="Treble dB (-2 = less robotic)"
+                    )
 
-                    btn = gr.Button("🚀 Generate करो", variant="primary", size="lg")
+                    gr.Markdown("---")
 
+                    # ── Options ──
+                    with gr.Row():
+                        sln  = gr.Checkbox(label="Silence Remove", value=True)
+                        norm = gr.Checkbox(label="Normalize",       value=True)
+                        eq   = gr.Checkbox(label="EQ",              value=True)
+                    with gr.Row():
+                        dess = gr.Checkbox(label="DeEsser", value=True)
+                        comp = gr.Checkbox(label="Compress", value=True)
+
+                    out_fmt = gr.Radio(
+                        choices=["wav","mp3","ogg"],
+                        value="wav", label="Format"
+                    )
+                    custom_raw = gr.Textbox(
+                        label="Custom Words (WORD = उच्चारण)",
+                        placeholder="PAISAWALA = पेसावाला",
+                        lines=2
+                    )
+
+                    btn = gr.Button(
+                        "Generate Karo",
+                        variant="primary", size="lg"
+                    )
+
+            # ── Output ──
             with gr.Row():
                 with gr.Column(scale=2):
-                    out_audio = gr.Audio(label="🎧 Output", type="filepath", autoplay=True)
+                    out_audio = gr.Audio(
+                        label="Output",
+                        type="filepath", autoplay=True
+                    )
                 with gr.Column(scale=1):
-                    out_status = gr.Textbox(label="📊 Status", interactive=False,
-                                            lines=7, elem_classes=["status-out"])
+                    out_status = gr.Textbox(
+                        label="Status", interactive=False,
+                        lines=8, elem_classes=["status-out"]
+                    )
 
-            with gr.Accordion("🔍 Chunk Preview", open=False):
+            with gr.Accordion("Chunk Preview", open=False):
                 with gr.Row():
-                    chunk_dd  = gr.Dropdown(label="Part", choices=[], interactive=True)
-                    chunk_btn = gr.Button("▶️ Play", size="sm")
-                chunk_out = gr.Audio(label="Chunk", type="filepath", autoplay=True)
+                    chunk_dd  = gr.Dropdown(
+                        label="Part", choices=[], interactive=True
+                    )
+                    chunk_btn = gr.Button("Play", size="sm")
+                chunk_out = gr.Audio(
+                    label="Chunk", type="filepath", autoplay=True
+                )
                 chunk_btn.click(get_chunk_audio, [chunk_dd], [chunk_out])
 
             btn.click(
@@ -1284,15 +1322,15 @@ with gr.Blocks(css=CSS, title="शिव AI v4.0 Turbo") as demo:
             )
 
         # ═══ TAB 2: Dictionary ═══
-        with gr.Tab("📖 Custom Dictionary"):
-            gr.Markdown("### Custom words permanently save karo")
+        with gr.Tab("Dictionary"):
+            gr.Markdown("### Custom words save karo")
             with gr.Row():
                 with gr.Column():
                     dw = gr.Textbox(label="Word", placeholder="PAISAWALA")
                     dp = gr.Textbox(label="Pronunciation", placeholder="पेसावाला")
                     with gr.Row():
-                        da = gr.Button("➕ Add", variant="primary")
-                        dr = gr.Button("🗑️ Remove", variant="secondary")
+                        da = gr.Button("Add", variant="primary")
+                        dr = gr.Button("Remove", variant="secondary")
                     ds = gr.Textbox(label="Status", interactive=False, lines=2)
                 with gr.Column():
                     dd = gr.Markdown(load_dict_md())
@@ -1300,59 +1338,34 @@ with gr.Blocks(css=CSS, title="शिव AI v4.0 Turbo") as demo:
             dr.click(dict_remove, [dw],    [ds,dd])
 
         # ═══ TAB 3: Guide ═══
-        with gr.Tab("📚 Guide"):
+        with gr.Tab("Guide"):
             gr.Markdown("""
-### 🚩 Shiv AI v3.5 — Complete Guide
+### Shiv AI v4.0 — Guide
 
----
-#### 🎤 Voice 100% Match kaise karein?
+**Awaaz Upload:**
+- 6-30 second ki clear recording upload karein
+- Quiet room, no background noise
+- WAV ya MP3 dono chalega
 
-**Step 1 — Acha Reference Upload karo:**
-- 6-20 second ki apni awaaz record karo
-- Quiet room mein bolo, background noise nahi
-- **2-3 clips upload karo** — zyada data = better match
+**Match Quality:**
+- 12 = good (fast)
+- 24 = best (slow)
+- Zyada = better match but slow
 
-**Step 2 — gpt_cond_len badhao:**
-- Default 6 → `12` ya `18` karo
-- Zyada = slower but voice matching better hogi
+**EQ Tips:**
+- Bass +5 = natural voice
+- Treble -2 = less robotic
+- DeEsser = harsh sound hatata hai
 
-**Step 3 — Pitch Correction:**
-- librosa install karo: `pip install librosa`
-- Agar generated voice thodi upar/neeche lag rahi hai
-- `-1` ya `-2` semitones try karo
+**Speed:**
+- 0 = tone preset ki speed
+- 0.9 = thoda slow, clear
+- 1.0 = normal
 
----
-#### 🎛️ EQ Recommendations
-| Problem | Fix |
-|---------|-----|
-| Voice thin/hollow | Bass +5 to +8 dB |
-| Harsh/nasal sound | Mid -2 dB |
-| Robotic/sharp | Treble -2 to -4 dB |
-| Sibilance (harsh 's') | DeEsser ON karo |
-
----
-#### 🌐 Trilingual — Best Practices
-```
-✅ Hindi:    आज हम बात करेंगे।
-✅ English:  Chunks automatically detect honge।
-✅ Sanskrit: Om, dharma, karma auto-convert।
-```
-
----
-#### 🎭 Emotion Guide
-| Mode | Best For |
-|------|----------|
-| 🧘 Calm | Meditation, slow narration |
-| 😊 Normal | YouTube videos, general |
-| 🎙️ Pro | News, motivational |
-| 🔥 Dramatic | Story, energetic |
-
----
-#### ⚡ Pro Tips
-- **Speed 0.95** = natural feel (1.0 thoda fast lagta hai)
-- **Compressor ON** = volume consistent rahegi
-- **DeEsser ON** = TTS ka artificial sharpness hatega
-- **MP3 export** = YouTube upload ke liye best
+**Format:**
+- WAV = best quality
+- MP3 = YouTube ke liye (192kbps)
             """)
+
 
 demo.launch(share=True, show_error=True)
