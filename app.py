@@ -465,31 +465,53 @@ def check_ref_quality(filepath):
     except Exception as e:
         return f"⚠️ Check failed: {e}"
 
+def estimate_f0(filepath):
+    """Reference audio ka F0 (fundamental frequency) nikalo"""
+    try:
+        from scipy.io import wavfile as wf
+        from scipy.signal import find_peaks
+        sr, data = wf.read(filepath)
+        if data.ndim == 2: data = data.mean(axis=1)
+        data = data.astype(np.float32)
+        # Middle segment use karo
+        mid = len(data)//4
+        seg = data[mid:mid+sr//2]
+        seg = seg / (np.max(np.abs(seg)) + 1e-9)
+        corr = np.correlate(seg, seg, mode='full')
+        corr = corr[len(corr)//2:]
+        min_lag = int(sr / 500)
+        max_lag = int(sr / 60)
+        peaks, _ = find_peaks(corr[min_lag:max_lag], height=0.25)
+        if len(peaks) > 0:
+            return sr / (peaks[0] + min_lag)
+    except:
+        pass
+    return None
+
+# Global: reference F0 store karo pitch correction ke liye
+_ref_f0 = None
+
 def prepare_reference(filepath, out="ref_ready.wav"):
-    """
-    Reference audio — voice match ke liye maximum optimize karo
-    XTTS v2: 6-30 sec best, 22050Hz mono, -20dB to -6dB RMS
-    """
+    """Reference audio — voice match ke liye maximum optimize"""
+    global _ref_f0
     try:
         a = AudioSegment.from_file(filepath)
-        # Step 1: Mono + 22050Hz
         a = a.set_channels(1).set_frame_rate(22050)
-        # Step 2: Gentle silence trim (padding zyada rakho — natural breath chahiye)
         try:
             a = effects.strip_silence(a, silence_thresh=-40, padding=300)
         except: pass
-        # Step 3: Target RMS -18dB (XTTS optimal range)
-        target_dbfs = -18.0
+        # Target -20dBFS (XTTS optimal)
+        target_dbfs = -20.0
         change = target_dbfs - a.dBFS
         a = a.apply_gain(change)
-        # Step 4: Min 8 sec — repeat if needed (better embedding)
         if len(a) < 8000:
             while len(a) < 8000: a = a + a
-        # Step 5: Max 30 sec (longer = better speaker match)
         if len(a) > 30000:
             a = a[:30000]
         a.export(out, format="wav")
-        print(f"Reference ready: {len(a)/1000:.1f}s, {a.dBFS:.1f}dBFS")
+        # F0 measure karo
+        _ref_f0 = estimate_f0(out)
+        print(f"Reference ready: {len(a)/1000:.1f}s, {a.dBFS:.1f}dBFS, F0={_ref_f0:.0f}Hz" if _ref_f0 else f"Reference ready: {len(a)/1000:.1f}s")
         return out
     except Exception as e:
         print(f"Ref prep error: {e}")
@@ -985,11 +1007,18 @@ def generate_v35(
     combined = crossfade_join(segments, cf_ms=60)
     print(f"After join: {len(combined)/1000:.1f}s")
 
-    # Normalize
+    # Normalize + Volume Match
     if use_normalize:
-        progress(0.86, desc="🧹 Normalize...")
+        progress(0.86, desc="Normalize + Volume Match...")
         combined = combined.set_frame_rate(22050).set_channels(1)
-        combined = effects.normalize(combined)
+        # Target -22dBFS (original voice ka level)
+        target_dbfs = -22.0
+        current_dbfs = combined.dBFS
+        gain_needed = target_dbfs - current_dbfs
+        # Max -9dB adjustment (analysis result)
+        gain_needed = max(gain_needed, -12.0)
+        combined = combined.apply_gain(gain_needed)
+        print(f"Volume match: {current_dbfs:.1f} -> {combined.dBFS:.1f} dBFS")
 
     # EQ
     if use_eq:
@@ -1006,10 +1035,30 @@ def generate_v35(
         progress(0.93, desc="🗜️ Compressing...")
         combined = compress_audio(combined, threshold_db=-18, ratio=3.0)
 
-    # Pitch shift (NEW)
-    if pitch_shift_enable and abs(float(pitch_semitones)) > 0.05:
-        progress(0.95, desc=f"🎵 Pitch shift {pitch_semitones:+.1f} semitones...")
-        combined = pitch_shift_audio(combined, float(pitch_semitones))
+    # Auto Pitch Correction
+    if pitch_shift_enable:
+        manual = float(pitch_semitones)
+        if abs(manual) > 0.05:
+            # Manual override
+            progress(0.95, desc=f"Pitch shift {manual:+.1f} semitones...")
+            combined = pitch_shift_audio(combined, manual)
+        elif _ref_f0 and LIBROSA_OK:
+            # Auto: generated audio ka F0 detect karo aur match karo
+            try:
+                progress(0.95, desc="Auto pitch matching...")
+                tmp_path = "tmp_pitch_check.wav"
+                combined.export(tmp_path, format="wav")
+                gen_f0 = estimate_f0(tmp_path)
+                if gen_f0 and _ref_f0:
+                    auto_semitones = 12 * np.log2(_ref_f0 / gen_f0)
+                    # Cap at ±6 semitones (sane range)
+                    auto_semitones = np.clip(auto_semitones, -6, 6)
+                    if abs(auto_semitones) > 0.5:
+                        print(f"Auto pitch: ref={_ref_f0:.0f}Hz gen={gen_f0:.0f}Hz shift={auto_semitones:+.1f}st")
+                        combined = pitch_shift_audio(combined, float(auto_semitones))
+                if os.path.exists(tmp_path): os.remove(tmp_path)
+            except Exception as pe:
+                print(f"Auto pitch skip: {pe}")
 
     # Export
     progress(0.97, desc=f"💾 Export as {output_format.upper()}...")
@@ -1249,16 +1298,16 @@ with gr.Blocks(css=CSS, title="Shiv AI v4.0") as demo:
                     # ── EQ ──
                     gr.Markdown("### EQ")
                     bass_sl = gr.Slider(
-                        minimum=-6.0, maximum=12.0, value=5.0, step=0.5,
-                        label="Bass dB (+5 recommended)"
+                        minimum=-6.0, maximum=12.0, value=1.5, step=0.5,
+                        label="Bass dB (analysis: +1.5 for aideva voice)"
                     )
                     mid_sl = gr.Slider(
                         minimum=-6.0, maximum=6.0, value=0.0, step=0.5,
                         label="Mid dB"
                     )
                     treble_sl = gr.Slider(
-                        minimum=-9.0, maximum=3.0, value=-2.0, step=0.5,
-                        label="Treble dB (-2 = less robotic)"
+                        minimum=-9.0, maximum=3.0, value=-1.5, step=0.5,
+                        label="Treble dB (-1.5 recommended)"
                     )
 
                     gr.Markdown("---")
