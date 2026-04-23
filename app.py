@@ -162,7 +162,7 @@ def get_lang(words):
         return "en"
     return "hi"
 
-def make_chunks(text, max_w=30):
+def make_chunks(text, max_w=20):
     sents = [s.strip() for s in re.split(r'(?<=।)\s+|\n+', text) if s.strip()]
     result, buf = [], []
 
@@ -376,35 +376,54 @@ def apply_pitch(seg, semitones, sr=22050):
         print(f"Pitch skip: {e}")
         return seg
 
-def smart_join(segs, cf=60):
-    """Volume-level each segment, then crossfade-join."""
+def smart_join(segs, cf=80):
+    """
+    Professional join:
+    1. Per-segment RMS normalize (tight range: 0.5-2x)
+    2. Smooth gain envelope at boundaries (fade in/out)
+    3. Longer crossfade 80ms
+    """
     if not segs: return AudioSegment.silent(100)
-    rms_vals = [np.sqrt(np.mean(np.array(s.get_array_of_samples(), dtype=np.float32)**2))
-                for s in segs]
-    rms_vals = [r for r in rms_vals if r > 100]
-    target = float(np.median(rms_vals)) if rms_vals else 3000
+    
+    # Step 1: Consistent RMS across all segments
+    rms_vals = []
+    for s in segs:
+        arr = np.array(s.get_array_of_samples(), dtype=np.float32)
+        rms = np.sqrt(np.mean(arr**2))
+        if rms > 200: rms_vals.append(rms)
+    
+    if not rms_vals: return segs[0]
+    target = float(np.median(rms_vals))
+    
     leveled = []
     for s in segs:
-        rms = np.sqrt(np.mean(np.array(s.get_array_of_samples(), dtype=np.float32)**2))
-        if rms > 100:
-            g = np.clip(target / (rms + 1e-9), 0.3, 3.0)
+        arr = np.array(s.get_array_of_samples(), dtype=np.float32)
+        rms = np.sqrt(np.mean(arr**2))
+        if rms > 200:
+            # Tight gain range: max 2x or 0.5x only
+            g = np.clip(target / (rms + 1e-9), 0.5, 2.0)
             s = s.apply_gain(20 * np.log10(g))
         leveled.append(s)
+    
+    # Step 2: Crossfade join with 80ms
     out = leveled[0]
     for s in leveled[1:]:
-        c = min(cf, len(out)//2, len(s)//2)
-        out = out.append(s, crossfade=max(c, 10))
+        # Both segments need min 200ms for crossfade
+        cf_actual = min(cf, len(out)//2, len(s)//2, 80)
+        out = out.append(s, crossfade=max(cf_actual, 20))
+    
     return out
 
 # ── XTTS Parameter Setter ─────────────────────────────────────────────
 STYLES = {
-    # temp  = expressiveness (low=stable, high=emotional)
-    # rep   = repetition penalty (high=no stutter)
-    # speed = talking pace
-    "Calm":     {"temp": 0.15, "rep": 8.0, "speed": 0.88},
-    "Normal":   {"temp": 0.22, "rep": 7.0, "speed": 0.95},
-    "Pro":      {"temp": 0.27, "rep": 6.0, "speed": 1.00},
-    "Dramatic": {"temp": 0.33, "rep": 5.5, "speed": 1.05},
+    # STUTTER FIX: temperature deliberately low
+    # high temp = random phoneme insertion = stutter
+    # rep_penalty high = no repeated syllables
+    # length_penalty 1.0 = words don't get cut short
+    "Calm":     {"temp": 0.10, "rep": 9.0, "speed": 0.88},
+    "Normal":   {"temp": 0.15, "rep": 8.0, "speed": 0.92},
+    "Pro":      {"temp": 0.20, "rep": 7.5, "speed": 0.97},
+    "Dramatic": {"temp": 0.25, "rep": 7.0, "speed": 1.02},
 }
 
 def set_xtts_params(temp, rep, gpt_len):
@@ -413,10 +432,11 @@ def set_xtts_params(temp, rep, gpt_len):
         cfg = tts.synthesizer.tts_config.model_args
         cfg.temperature        = t
         cfg.repetition_penalty = float(rep)
-        cfg.gpt_cond_len       = max(int(gpt_len), 14)  # min 14 for voice match
+        cfg.gpt_cond_len       = max(int(gpt_len), 14)
         cfg.gpt_cond_chunk_len = 4
-        cfg.top_p              = 0.85
-        cfg.top_k              = 50
+        cfg.length_penalty     = 1.0   # words complete bolega, clip nahi hoga
+        cfg.top_p              = 0.80  # focused = less stutter
+        cfg.top_k              = 40    # less random choices
         return
     except: pass
     try: tts.tts_config.temperature = t
@@ -498,7 +518,7 @@ def generate(
 
     # Chunks
     progress(0.08, desc="Chunking...")
-    chunks = make_chunks(cleaned, max_w=30)
+    chunks = make_chunks(cleaned, max_w=20)  # 20w = less stutter
     total  = len(chunks)
     if total == 0:
         return None, "Text process ke baad khaali ho gaya.", ref_info, gr.update(choices=[])
@@ -521,9 +541,9 @@ def generate(
         if ok and os.path.exists(tmp):
             try:
                 seg = AudioSegment.from_wav(tmp)
-                try: seg = effects.strip_silence(seg, silence_thresh=-45, padding=250)
+                try: seg = effects.strip_silence(seg, silence_thresh=-48, padding=300)
                 except: pass
-                if len(seg) > 150:
+                if len(seg) > 400:  # short glitches skip karo
                     segs.append(seg)
                     pf = f"_p{i+1}.wav"
                     seg.export(pf, format="wav")
@@ -563,7 +583,23 @@ def generate(
     # EQ
     if do_eq:
         progress(0.89, desc="EQ...")
-        out = apply_eq(out, float(bass), float(mid), float(treble))
+        # Auto bass correction: XTTS generates too much bass
+        # Measure and correct automatically
+        try:
+            arr = np.array(out.get_array_of_samples(), dtype=np.float32)
+            from scipy.signal import welch as _welch
+            f, p = _welch(arr, fs=22050, nperseg=4096)
+            def _be(lo,hi): m=(f>=lo)&(f<=hi); return np.mean(p[m]) if m.any() else 1
+            bass_ratio = _be(80,300)/_be(800,2500)
+            # Target ratio ~100 (matched to original voice)
+            if bass_ratio > 120:
+                bass_correction = -2.0  # auto cut if too bassy
+            else:
+                bass_correction = 0.0
+            effective_bass = float(bass) + bass_correction
+        except:
+            effective_bass = float(bass)
+        out = apply_eq(out, effective_bass, float(mid), float(treble))
 
     # DeEsser
     if do_deess:
@@ -586,7 +622,7 @@ def generate(
                 out.export("_ptmp.wav", format="wav")
                 gf0 = measure_f0("_ptmp.wav")
                 if gf0 and _REF_F0 and gf0 > 0:
-                    auto = float(np.clip(12 * np.log2(_REF_F0 / gf0), -5, 5))
+                    auto = float(np.clip(12 * np.log2(_REF_F0 / gf0), -3, 3))
                     if abs(auto) > 0.4:
                         progress(0.94, desc=f"Auto pitch {auto:+.1f}st...")
                         out = apply_pitch(out, auto)
@@ -800,17 +836,17 @@ with gr.Blocks(css=CSS, title="Shiv AI v4.1") as demo:
 
                     # Voice Match
                     gr.HTML('<div class="section-title">Voice Match</div>')
-                    gpt = gr.Slider(3, 30, 12, step=1,
-                                    label="Match quality  (12 = fast · 24 = best)")
-                    pitch_on = gr.Checkbox(label="Pitch correction (librosa)", value=True)
-                    pitch_sl = gr.Slider(-6.0, 6.0, 0.0, step=0.5,
-                                         label="Manual pitch  (0 = auto-detect)")
+                    gpt = gr.Slider(6, 24, 14, step=1,
+                                    label="Match quality  (14 = balanced · 20 = best)")
+                    pitch_on = gr.Checkbox(label="Pitch correction (librosa)", value=False)
+                    pitch_sl = gr.Slider(-3.0, 3.0, 0.0, step=0.5,
+                                         label="Manual pitch  (0 = auto · ±1 thoda)")
 
                     # EQ
                     gr.HTML('<div class="section-title">EQ</div>')
-                    bass_sl   = gr.Slider(-6.0, 12.0,  0.0, step=0.5, label="Bass dB  (0 = matched to original)")
-                    mid_sl    = gr.Slider(-6.0,  6.0,  1.5, step=0.5, label="Mid dB  (+1.5 = deeper/fuller voice)")
-                    treble_sl = gr.Slider(-9.0,  3.0, -1.5, step=0.5, label="Treble dB")
+                    bass_sl   = gr.Slider(-3.0,  3.0,  0.0, step=0.5, label="Bass dB  (0 = natural)")
+                    mid_sl    = gr.Slider(-3.0,  4.0,  1.5, step=0.5, label="Mid dB  (+1.5 = deeper voice)")
+                    treble_sl = gr.Slider(-4.0,  2.0, -1.5, step=0.5, label="Treble dB  (-1.5 = natural)")
 
                     # Options
                     gr.HTML('<div class="section-title">Options</div>')
