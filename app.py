@@ -1,5 +1,5 @@
 # Shiv AI v5.0 — Dual Engine Voice Cloning
-# XTTS v2 (Hindi/Sanskrit/Long audio) + OmniVoice (Realistic/Emotions/600+ languages)
+# XTTS v2 (Hindi/Sanskrit/Long audio) + Voice (Realistic/Emotions/600+ languages)
 # PAISAWALA | Shri Ram Nag
 
 import os, re, gc, json, glob
